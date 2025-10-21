@@ -187,9 +187,14 @@ class LDAPRequester():
             self._logger.warning('Server returns LDAPStrongerAuthRequiredResult')
             if not self._sign_and_seal_supported:
                 self._logger.warning('Sealing not available, falling back to LDAPS')
-                # I don't know how to reuse the same Server object, but TLS enabled
+                # Configure TLS with proper settings for channel binding support (like ldapdomaindump)
+                tls_config = ldap3.Tls(
+                    validate=ssl.CERT_NONE,
+                    version=ssl.PROTOCOL_TLSv1_2,
+                    ciphers='ALL:@SECLEVEL=0'
+                )
                 ldap_server_kwargs = {'host': self._domain_controller, 'formatter': self._formatter,
-                                      'get_info': ldap3.ALL, 'use_ssl': True}
+                                      'get_info': ldap3.ALL, 'use_ssl': True, 'tls': tls_config}
                 server = ldap3.Server(**ldap_server_kwargs)
                 self._do_ntlm_auth(server)
                 return
@@ -206,82 +211,220 @@ class LDAPRequester():
     def _do_kerberos_auth(self, server, seal_and_sign=False):
         self._logger.debug('LDAP authentication with Kerberos: ldap_scheme = {0} / seal_and_sign = {1}'.format(
                             "ldaps" if server.ssl else "ldap", seal_and_sign))
-        ldap_connection_kwargs = {"server": server , 'user': '{}@{}'.format(self._user, self._domain.upper()),
-                                  'raise_exceptions': True, 'authentication': ldap3.SASL,
-                                  'sasl_mechanism': ldap3.KERBEROS}
 
-        if seal_and_sign:
-            ldap_connection_kwargs['session_security'] = ldap3.ENCRYPT
+        # Try to use cached tickets first, otherwise obtain with credentials
+        use_cached_ticket = False
+        ccache = None
+        TGT = None
+        TGS = None
 
-        # Verifying if we have the correct TGS/TGT to interrogate the LDAP server
-        ccache = CCache.loadFile(os.getenv('KRB5CCNAME'))
-        principal = 'ldap/{}@{}'.format(self._domain_controller.lower(), self._queried_domain.upper())
+        # Check if KRB5CCNAME exists and try to use cached tickets
+        if os.getenv('KRB5CCNAME'):
+            try:
+                ccache = CCache.loadFile(os.getenv('KRB5CCNAME'))
+                principal = 'ldap/{}@{}'.format(self._domain_controller.lower(), self._queried_domain.upper())
 
-        # We look for the TGS with the right SPN
-        creds = ccache.getCredential(principal, anySPN=False)
-        if creds:
-            self._logger.debug('TGS found in KRB5CCNAME file')
-            creds_server_lower = creds['server'].prettyPrint().lower().decode('utf-8')
-            creds_server = creds['server'].prettyPrint().decode('utf-8')
-            if creds_server_lower.split('@')[0] != creds_server.split('@')[0]:
-                self._logger.debug('SPN not in lowercase, patching SPN')
-                new_creds = self._patch_spn(creds, principal)
-                # We build a new CCache with the new ticket
-                ccache.credentials.append(new_creds)
-                temp_ccache = tempfile.NamedTemporaryFile()
-                ccache.saveFile(temp_ccache.name)
-                cred_store = {'ccache': 'FILE:{}'.format(temp_ccache.name)}
-            else:
-                self._logger.debug('SPN is good, no patching needed')
-                cred_store = dict()
+                # We look for the TGS with the right SPN
+                creds = ccache.getCredential(principal, anySPN=False)
+                if creds:
+                    self._logger.debug('TGS found in KRB5CCNAME file')
+                    use_cached_ticket = True
+                else:
+                    # If we don't find it, we search for any SPN
+                    creds = ccache.getCredential(principal, anySPN=True)
+                    if creds:
+                        self._logger.debug('Alternative TGS found in cache')
+                        use_cached_ticket = True
+                    else:
+                        # Check for TGT
+                        tgt_principal = 'krbtgt/{}@{}'.format(self._queried_domain.upper(), self._queried_domain.upper())
+                        tgt_creds = ccache.getCredential(tgt_principal)
+                        if tgt_creds:
+                            self._logger.debug('TGT found in cache, will use it')
+                            use_cached_ticket = True
+            except Exception as e:
+                self._logger.debug(f'Could not load cached tickets: {e}')
+                use_cached_ticket = False
+
+        # If no cached tickets, obtain TGT/TGS with credentials
+        if not use_cached_ticket:
+            self._logger.debug('No cached tickets found or cache unavailable, obtaining TGT/TGS with credentials')
+
+            # Use password-based Kerberos authentication (like ldapdomaindump)
+            try:
+                from impacket.krb5.kerberosv5 import getKerberosTGT, getKerberosTGS
+                from binascii import unhexlify
+
+                # Prepare credentials
+                lmhash = self._lmhash if self._lmhash else ''
+                nthash = self._nthash if self._nthash else ''
+                password = self._password if self._password else ''
+
+                # Convert hashes if provided
+                if lmhash or nthash:
+                    if lmhash:
+                        try:
+                            lmhash = unhexlify(lmhash)
+                        except:
+                            pass
+                    if nthash:
+                        try:
+                            nthash = unhexlify(nthash)
+                        except:
+                            pass
+
+                # Get TGT
+                userName = Principal(self._user, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
+                self._logger.debug(f'Obtaining TGT for {self._user}@{self._domain}')
+                tgt, cipher, oldSessionKey, sessionKey = getKerberosTGT(
+                    userName, password, self._domain, lmhash, nthash, '', None
+                )
+
+                # Get TGS for LDAP service
+                serverName = Principal(f'ldap/{self._domain_controller}',
+                                     type=constants.PrincipalNameType.NT_SRV_INST.value)
+                self._logger.debug(f'Obtaining TGS for ldap/{self._domain_controller}')
+                tgs, cipher, oldSessionKey, sessionKey = getKerberosTGS(
+                    serverName, self._domain, None, tgt, cipher, sessionKey
+                )
+
+                # Build GSS-SPNEGO blob manually
+                from pyasn1.codec.ber import encoder, decoder
+                from pyasn1.type.univ import noValue
+                from impacket.krb5.asn1 import AP_REQ, Authenticator, TGS_REP, seq_set
+                from impacket.krb5.types import Ticket as Tickety, KerberosTime
+                from impacket.spnego import SPNEGO_NegTokenInit, TypesMech
+                from datetime import datetime
+
+                blob = SPNEGO_NegTokenInit()
+                blob['MechTypes'] = [TypesMech['MS KRB5 - Microsoft Kerberos 5']]
+
+                tgs_decoded = decoder.decode(tgs, asn1Spec=TGS_REP())[0]
+                ticket = Tickety()
+                ticket.from_asn1(tgs_decoded['ticket'])
+
+                apReq = AP_REQ()
+                apReq['pvno'] = 5
+                apReq['msg-type'] = int(constants.ApplicationTagNumbers.AP_REQ.value)
+                opts = []
+                apReq['ap-options'] = constants.encodeFlags(opts)
+                seq_set(apReq, 'ticket', ticket.to_asn1)
+
+                authenticator = Authenticator()
+                authenticator['authenticator-vno'] = 5
+                authenticator['crealm'] = self._domain
+                seq_set(authenticator, 'cname', userName.components_to_asn1)
+                now = datetime.utcnow()
+                authenticator['cusec'] = now.microsecond
+                authenticator['ctime'] = KerberosTime.to_asn1(now)
+
+                encodedAuthenticator = encoder.encode(authenticator)
+                encryptedEncodedAuthenticator = cipher.encrypt(sessionKey, 11, encodedAuthenticator, None)
+                apReq['authenticator'] = noValue
+                apReq['authenticator']['etype'] = cipher.enctype
+                apReq['authenticator']['cipher'] = encryptedEncodedAuthenticator
+
+                blob['MechToken'] = encoder.encode(apReq)
+
+                # Bind using GSS-SPNEGO
+                ldap_connection = ldap3.Connection(server, raise_exceptions=True)
+                ldap_connection.open()  # Let it read server info (server was created with get_info=ALL)
+
+                request = ldap3.operation.bind.bind_operation(
+                    ldap_connection.version, ldap3.SASL, self._user, None, 'GSS-SPNEGO', blob.getData()
+                )
+
+                ldap_connection.sasl_in_progress = True
+                response = ldap_connection.post_send_single_response(
+                    ldap_connection.send('bindRequest', request, None)
+                )
+                ldap_connection.sasl_in_progress = False
+
+                if response[0]['result'] != 0:
+                    self._logger.critical(f'Kerberos authentication failed: {response}')
+                    sys.exit(-1)
+
+                ldap_connection.bound = True
+
+                # Explicitly refresh server info after binding
+                if server.info is None:
+                    self._logger.debug('Server info not populated, fetching manually')
+                    server.get_info_from_server(ldap_connection)
+
+            except Exception as e:
+                self._logger.critical(f'Password-based Kerberos authentication failed: {e}')
+                import traceback
+                self._logger.debug(traceback.format_exc())
+                sys.exit(-1)
+
         else:
-            self._logger.debug('TGS not found in KRB5CCNAME, looking for '
-                    'TGS with alternative SPN')
-            # If we don't find it, we search for any SPN
-            creds = ccache.getCredential(principal, anySPN=True)
-            if creds:
-                # If we find one, we build a custom TGS
-                self._logger.debug('Alternative TGS found, patching SPN')
-                new_creds = self._patch_spn(creds, principal)
-                # We build a new CCache with the new ticket
-                ccache.credentials.append(new_creds)
-                temp_ccache = tempfile.NamedTemporaryFile()
-                ccache.saveFile(temp_ccache.name)
-                cred_store = {'ccache': 'FILE:{}'.format(temp_ccache.name)}
-            else:
-                # If we don't find any, we hope for the best (TGT in cache)
-                self._logger.debug('Alternative TGS not found, using KRB5CCNAME as is '
-                        'while hoping it contains a TGT')
-                cred_store = dict()
-        ldap_connection_kwargs['cred_store'] = cred_store
-        self._logger.debug('LDAP binding parameters: server = {0} / user = {1} '
-               '/ Kerberos auth'.format(self._domain_controller, self._user))
+            # Use cached tickets (original logic)
+            ldap_connection_kwargs = {"server": server , 'user': '{}@{}'.format(self._user, self._domain.upper()),
+                                      'raise_exceptions': True, 'authentication': ldap3.SASL,
+                                      'sasl_mechanism': ldap3.KERBEROS}
 
-        try:
-            ldap_connection = ldap3.Connection(**ldap_connection_kwargs)
-            ldap_connection.bind()
-        except ldap3.core.exceptions.LDAPSocketOpenError as e:
+            if seal_and_sign:
+                ldap_connection_kwargs['session_security'] = ldap3.ENCRYPT
+
+            principal = 'ldap/{}@{}'.format(self._domain_controller.lower(), self._queried_domain.upper())
+            creds = ccache.getCredential(principal, anySPN=False)
+
+            if creds:
+                creds_server_lower = creds['server'].prettyPrint().lower().decode('utf-8')
+                creds_server = creds['server'].prettyPrint().decode('utf-8')
+                if creds_server_lower.split('@')[0] != creds_server.split('@')[0]:
+                    self._logger.debug('SPN not in lowercase, patching SPN')
+                    new_creds = self._patch_spn(creds, principal)
+                    ccache.credentials.append(new_creds)
+                    temp_ccache = tempfile.NamedTemporaryFile(delete=False)
+                    ccache.saveFile(temp_ccache.name)
+                    cred_store = {'ccache': 'FILE:{}'.format(temp_ccache.name)}
+                else:
+                    self._logger.debug('SPN is good, no patching needed')
+                    cred_store = dict()
+            else:
+                creds = ccache.getCredential(principal, anySPN=True)
+                if creds:
+                    self._logger.debug('Alternative TGS found, patching SPN')
+                    new_creds = self._patch_spn(creds, principal)
+                    ccache.credentials.append(new_creds)
+                    temp_ccache = tempfile.NamedTemporaryFile(delete=False)
+                    ccache.saveFile(temp_ccache.name)
+                    cred_store = {'ccache': 'FILE:{}'.format(temp_ccache.name)}
+                else:
+                    self._logger.debug('Using KRB5CCNAME as is')
+                    cred_store = dict()
+
+            ldap_connection_kwargs['cred_store'] = cred_store
+
+            try:
+                ldap_connection = ldap3.Connection(**ldap_connection_kwargs)
+                ldap_connection.bind()
+            except ldap3.core.exceptions.LDAPSocketOpenError as e:
                 self._logger.critical(e)
                 if self._do_tls:
                     self._logger.critical('TLS negociation failed, this error is mostly due to your host '
                                           'not supporting SHA1 as signing algorithm for certificates')
                 sys.exit(-1)
-
-        except ldap3.core.exceptions.LDAPStrongerAuthRequiredResult:
-            self._logger.warning('Server returns LDAPStrongerAuthRequiredResult')
-            if not self._sign_and_seal_supported:
-                self._logger.warning('Sealing not available, falling back to LDAPS')
-                server.use_ssl = True
-                # I don't know how to reuse the same Server object, but switched to TLS
-                ldap_server_kwargs = {'host': self._domain_controller, 'formatter': self._formatter,
-                                      'get_info': ldap3.ALL, 'use_ssl': True}
-                server = ldap3.Server(**ldap_server_kwargs)
-                self._do_kerberos_auth(server)
-                return
-            else:
-                self._logger.warning('Falling back to Kerberos sealing')
-                self._do_kerberos_auth(server, seal_and_sign=True)
-                return
+            except ldap3.core.exceptions.LDAPStrongerAuthRequiredResult:
+                self._logger.warning('Server returns LDAPStrongerAuthRequiredResult')
+                if not self._sign_and_seal_supported:
+                    self._logger.warning('Sealing not available, falling back to LDAPS')
+                    # Configure TLS with proper settings for channel binding support (like ldapdomaindump)
+                    tls_config = ldap3.Tls(
+                        validate=ssl.CERT_NONE,
+                        version=ssl.PROTOCOL_TLSv1_2,
+                        ciphers='ALL:@SECLEVEL=0'
+                    )
+                    ldap_server_kwargs = {'host': self._domain_controller, 'formatter': self._formatter,
+                                          'get_info': ldap3.ALL, 'use_ssl': True, 'tls': tls_config}
+                    server = ldap3.Server(**ldap_server_kwargs)
+                    self._do_kerberos_auth(server)
+                    return
+                else:
+                    self._logger.warning('Falling back to Kerberos sealing')
+                    self._do_kerberos_auth(server, seal_and_sign=True)
+                    return
 
         who_am_i = ldap_connection.extend.standard.who_am_i()
         self._logger.debug('Successfully connected to the LDAP as {}'.format(who_am_i))
@@ -407,8 +550,22 @@ class LDAPRequester():
                 self._logger.critical('-w with the FQDN must be used when authenticating with certificates')
                 sys.exit(-1)
             elif self._do_kerberos:
-                ccache = CCache.loadFile(os.getenv('KRB5CCNAME'))
-                self._domain = ccache.principal.realm['data'].decode('utf-8')
+                # Try to extract domain from cached ticket if available
+                try:
+                    if os.getenv('KRB5CCNAME'):
+                        ccache = CCache.loadFile(os.getenv('KRB5CCNAME'))
+                        if ccache is not None:
+                            self._domain = ccache.principal.realm['data'].decode('utf-8')
+                            self._logger.debug('Extracted domain from KRB5CCNAME: {}'.format(self._domain))
+                        else:
+                            self._logger.debug('KRB5CCNAME set but cache is empty, using queried domain')
+                            self._domain = queried_domain
+                    else:
+                        self._logger.debug('KRB5CCNAME not set, using queried domain for Kerberos auth')
+                        self._domain = queried_domain
+                except Exception as e:
+                    self._logger.debug('Could not load domain from cache ({}), using queried domain'.format(e))
+                    self._domain = queried_domain
             else:
                 self._logger.warning('User domain not specified, assuming it is the same than the queried domain')
                 self._domain = queried_domain
@@ -418,7 +575,14 @@ class LDAPRequester():
 
         if self._do_tls:
             ldap_server_kwargs['use_ssl'] = True
-            self._logger.debug('LDAPS connection forced')
+            # Configure TLS with proper settings for channel binding support (like ldapdomaindump)
+            tls_config = ldap3.Tls(
+                validate=ssl.CERT_NONE,
+                version=ssl.PROTOCOL_TLSv1_2,
+                ciphers='ALL:@SECLEVEL=0'
+            )
+            ldap_server_kwargs['tls'] = tls_config
+            self._logger.debug('LDAPS connection forced with TLS channel binding support')
         else:
             ldap_server_kwargs['use_ssl'] = False
 
