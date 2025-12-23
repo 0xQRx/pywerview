@@ -613,9 +613,7 @@ class LDAPRequester():
         # the function call. So we store it in an attriute and use it in `_ldap_search()`
         self._base_dn = base_dn
 
-    def _ldap_search(self, search_filter, class_result, attributes=list(), controls=list()):
-        results = list()
-
+    def _ldap_search(self, search_filter, class_result, attributes=list(), controls=list(), as_generator=False):
         # if no attribute name specified, we return all attributes
         if not attributes:
             attributes =  ldap3.ALL_ATTRIBUTES
@@ -628,6 +626,26 @@ class LDAPRequester():
         search_results=self._ldap_connection.extend.standard.paged_search(search_base=self._base_dn,
                 search_filter=search_filter, attributes=attributes,
                 controls=controls, paged_size=1000, generator=True)
+
+        if as_generator:
+            return self._ldap_search_generator(search_results, class_result)
+        else:
+            return self._ldap_search_list(search_results, class_result)
+
+    def _ldap_search_generator(self, search_results, class_result):
+        """Yield results one at a time to avoid memory exhaustion on large queries."""
+        try:
+            for result in search_results:
+                if result['type'] != 'searchResEntry':
+                    continue
+                yield class_result(result['attributes'])
+        except ldap3.core.exceptions.LDAPAttributeError as e:
+            self._logger.critical(e)
+            sys.exit(-1)
+
+    def _ldap_search_list(self, search_results, class_result):
+        """Collect all results into a list (original behavior)."""
+        results = list()
 
         try:
             # Skip searchResRef

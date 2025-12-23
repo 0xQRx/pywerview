@@ -302,7 +302,8 @@ class NetRequester(LDAPRPCRequester):
     def get_objectacl(self, queried_domain=str(), queried_sid=str(),
                      queried_name=str(), queried_sam_account_name=str(),
                      ads_path=str(), sacl=False, rights_filter=str(),
-                     resolve_sids=False, resolve_guids=False, custom_filter=str()):
+                     resolve_sids=False, resolve_guids=False, custom_filter=str(),
+                     as_generator=False):
         for attr_desc, attr_value in (('objectSid', queried_sid), ('name', escape_filter_chars(queried_name)),
                                       ('samAccountName', escape_filter_chars(queried_sam_account_name))):
             if attr_value:
@@ -342,10 +343,9 @@ class NetRequester(LDAPRPCRequester):
             controls = security_descriptor_control(criticality=True, sdflags=sdflags)
             acl_type = 'Dacl'
 
+        # Use generator mode for LDAP search when streaming to avoid memory exhaustion
         security_descriptors = self._ldap_search(object_filter, adobj.ADObject,
-                attributes=attributes, controls=controls)
-
-        acl = list()
+                attributes=attributes, controls=controls, as_generator=as_generator)
 
         rights_to_guid = {'reset-password': '{00299570-246d-11d0-a768-00aa006e0529}',
                 'write-members': '{bf9679c0-0de6-11d0-a285-00aa003049e2}',
@@ -356,6 +356,15 @@ class NetRequester(LDAPRPCRequester):
         if resolve_sids:
             sid_mapping = adobj.ADObject._well_known_sids.copy()
 
+        if as_generator:
+            return self._get_objectacl_generator(security_descriptors, acl_type, guid_filter,
+                                                  guid_map, resolve_sids, sid_mapping if resolve_sids else None)
+        else:
+            return self._get_objectacl_list(security_descriptors, acl_type, guid_filter,
+                                             guid_map, resolve_sids, sid_mapping if resolve_sids else None)
+
+    def _get_objectacl_generator(self, security_descriptors, acl_type, guid_filter, guid_map, resolve_sids, sid_mapping):
+        """Yield ACEs one at a time to avoid memory exhaustion on large queries."""
         for security_descriptor in security_descriptors:
             sd = SR_SECURITY_DESCRIPTOR()
             try:
@@ -363,44 +372,63 @@ class NetRequester(LDAPRPCRequester):
             except TypeError:
                 continue
             for ace in sd[acl_type]['Data']:
-                if guid_filter:
-                    try:
-                        object_type = format_uuid_le(ace['Ace']['ObjectType']) if ace['Ace']['ObjectType'] else '{00000000-0000-0000-0000-000000000000}'
-                    except KeyError:
-                        continue
-                    if object_type != guid_filter:
-                        continue
-                attributes = dict()
-                attributes['objectdn'] = security_descriptor.distinguishedname
-                attributes['objectsid'] = security_descriptor.objectsid
-                attributes['acetype'] = ace['TypeName']
-                attributes['binarysize'] = ace['AceSize']
-                attributes['aceflags'] = fmt.format_ace_flags(ace['AceFlags'])
-                attributes['accessmask'] = ace['Ace']['Mask']['Mask']
-                attributes['activedirectoryrights'] = fmt.format_ace_access_mask(ace['Ace']['Mask']['Mask'])
-                attributes['isinherited'] = bool(ace['AceFlags'] & 0x10)
-                attributes['securityidentifier'] = format_sid(ace['Ace']['Sid'].getData())
-                if resolve_sids:
-                    converted_sid = attributes['securityidentifier']
-                    attributes['securityidentifier'] = self._resolve_sid(converted_sid, sid_mapping)
-                try:
-                    attributes['objectaceflags'] = fmt.format_object_ace_flags(ace['Ace']['Flags'])
-                except KeyError:
-                    pass
-                try:
-                    attributes['objectacetype'] = format_uuid_le(ace['Ace']['ObjectType']) if ace['Ace']['ObjectType'] else '{00000000-0000-0000-0000-000000000000}'
-                    attributes['objectacetype'] = guid_map[attributes['objectacetype']]
-                except KeyError:
-                    pass
-                try:
-                    attributes['inheritedobjectacetype'] = format_uuid_le(ace['Ace']['InheritedObjectType']) if ace['Ace']['InheritedObjectType'] else '{00000000-0000-0000-0000-000000000000}'
-                    attributes['inheritedobjectacetype'] = guid_map[attributes['inheritedobjectacetype']]
-                except KeyError:
-                    pass
+                ace_obj = self._process_ace(ace, security_descriptor, guid_filter, guid_map, resolve_sids, sid_mapping)
+                if ace_obj:
+                    yield ace_obj
 
-                acl.append(adobj.ACE(attributes))
-
+    def _get_objectacl_list(self, security_descriptors, acl_type, guid_filter, guid_map, resolve_sids, sid_mapping):
+        """Collect all ACEs into a list (original behavior)."""
+        acl = list()
+        for security_descriptor in security_descriptors:
+            sd = SR_SECURITY_DESCRIPTOR()
+            try:
+                sd.fromString(security_descriptor.ntsecuritydescriptor)
+            except TypeError:
+                continue
+            for ace in sd[acl_type]['Data']:
+                ace_obj = self._process_ace(ace, security_descriptor, guid_filter, guid_map, resolve_sids, sid_mapping)
+                if ace_obj:
+                    acl.append(ace_obj)
         return acl
+
+    def _process_ace(self, ace, security_descriptor, guid_filter, guid_map, resolve_sids, sid_mapping):
+        """Process a single ACE and return an ACE object or None if filtered out."""
+        if guid_filter:
+            try:
+                object_type = format_uuid_le(ace['Ace']['ObjectType']) if ace['Ace']['ObjectType'] else '{00000000-0000-0000-0000-000000000000}'
+            except KeyError:
+                return None
+            if object_type != guid_filter:
+                return None
+        attributes = dict()
+        attributes['objectdn'] = security_descriptor.distinguishedname
+        attributes['objectsid'] = security_descriptor.objectsid
+        attributes['acetype'] = ace['TypeName']
+        attributes['binarysize'] = ace['AceSize']
+        attributes['aceflags'] = fmt.format_ace_flags(ace['AceFlags'])
+        attributes['accessmask'] = ace['Ace']['Mask']['Mask']
+        attributes['activedirectoryrights'] = fmt.format_ace_access_mask(ace['Ace']['Mask']['Mask'])
+        attributes['isinherited'] = bool(ace['AceFlags'] & 0x10)
+        attributes['securityidentifier'] = format_sid(ace['Ace']['Sid'].getData())
+        if resolve_sids:
+            converted_sid = attributes['securityidentifier']
+            attributes['securityidentifier'] = self._resolve_sid(converted_sid, sid_mapping)
+        try:
+            attributes['objectaceflags'] = fmt.format_object_ace_flags(ace['Ace']['Flags'])
+        except KeyError:
+            pass
+        try:
+            attributes['objectacetype'] = format_uuid_le(ace['Ace']['ObjectType']) if ace['Ace']['ObjectType'] else '{00000000-0000-0000-0000-000000000000}'
+            attributes['objectacetype'] = guid_map[attributes['objectacetype']]
+        except KeyError:
+            pass
+        try:
+            attributes['inheritedobjectacetype'] = format_uuid_le(ace['Ace']['InheritedObjectType']) if ace['Ace']['InheritedObjectType'] else '{00000000-0000-0000-0000-000000000000}'
+            attributes['inheritedobjectacetype'] = guid_map[attributes['inheritedobjectacetype']]
+        except KeyError:
+            pass
+
+        return adobj.ACE(attributes)
 
     @LDAPRPCRequester._ldap_connection_init
     def get_netuser(self, queried_username=str(), queried_domain=str(),

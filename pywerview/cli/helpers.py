@@ -102,16 +102,53 @@ def get_objectacl(domain_controller, domain, user, password=str(),
                 user_cert=str(), user_key=str(),
                 queried_sam_account_name=str(), ads_path=str(), sacl=False,
                 rights_filter=str(), resolve_sids=False, resolve_guids=False,
-                custom_filter=str()):
+                custom_filter=str(), output_file=str(), json_output=False):
     requester = NetRequester(domain_controller, domain, user, password,
                                  lmhash, nthash, do_kerberos, do_tls,
                                  user_cert, user_key)
-    return requester.get_objectacl(queried_domain=queried_domain,
-                    queried_sid=queried_sid, queried_name=queried_name,
-                    queried_sam_account_name=queried_sam_account_name,
-                    ads_path=ads_path, sacl=sacl, rights_filter=rights_filter,
-                    resolve_sids=resolve_sids, resolve_guids=resolve_guids,
-                    custom_filter=custom_filter)
+
+    # If output_file is specified, use generator mode to stream results to file
+    # This avoids memory exhaustion on large environments
+    if output_file:
+        as_generator = True
+        results = requester.get_objectacl(queried_domain=queried_domain,
+                        queried_sid=queried_sid, queried_name=queried_name,
+                        queried_sam_account_name=queried_sam_account_name,
+                        ads_path=ads_path, sacl=sacl, rights_filter=rights_filter,
+                        resolve_sids=resolve_sids, resolve_guids=resolve_guids,
+                        custom_filter=custom_filter, as_generator=as_generator)
+
+        count = 0
+        with open(output_file, 'w') as f:
+            if json_output:
+                import json
+                f.write('[\n')
+                first = True
+                for ace in results:
+                    if not first:
+                        f.write(',\n')
+                    first = False
+                    f.write(json.dumps(ace.to_json(), default=str))
+                    count += 1
+                f.write('\n]')
+            else:
+                first = True
+                for ace in results:
+                    if not first:
+                        f.write('\n\n')
+                    first = False
+                    f.write(str(ace))
+                    count += 1
+
+        # Return a message indicating results were written to file
+        return 'Wrote {} ACEs to {}'.format(count, output_file)
+    else:
+        return requester.get_objectacl(queried_domain=queried_domain,
+                        queried_sid=queried_sid, queried_name=queried_name,
+                        queried_sam_account_name=queried_sam_account_name,
+                        ads_path=ads_path, sacl=sacl, rights_filter=rights_filter,
+                        resolve_sids=resolve_sids, resolve_guids=resolve_guids,
+                        custom_filter=custom_filter)
 
 def get_netuser(domain_controller, domain, user, password=str(), lmhash=str(),
                 nthash=str(), do_kerberos=False,  

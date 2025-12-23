@@ -236,6 +236,8 @@ def main():
             help='Resolve GUIDs to their display names')
     get_objectacl_parser.add_argument('--custom-filter', dest='custom_filter',
             default=str(), help='Custom filter')
+    get_objectacl_parser.add_argument('-o', '--output-file', dest='output_file',
+            default=str(), help='Write results to file (streams results to avoid memory exhaustion on large environments)')
     get_objectacl_parser.set_defaults(func=get_objectacl)
 
     # Parser for the get-netuser command
@@ -657,6 +659,14 @@ def main():
     for k, v in vars(args).items():
         if k not in ('func', 'hashes', 'submodule', 'logging_level', 'json_output'):
             parsed_args[k] = v
+
+    # Pass json_output to get_objectacl when output_file is specified
+    # This allows streaming JSON output directly to file
+    try:
+        if parsed_args.get('output_file') and args.json_output:
+            parsed_args['json_output'] = True
+    except AttributeError:
+        pass
 
     starting_time = datetime.datetime.now()
     results = args.func(**parsed_args)
